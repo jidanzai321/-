@@ -1,275 +1,199 @@
 # -*- coding: utf-8 -*-
 """
-Cross‑Venue Crypto Order‑Book Aggregator
-========================================
-A **self‑contained Python 3.11 script** that pulls Level‑2 depth from multiple
-centralised exchanges (CEX) via *ccxt.pro* WebSockets **and** from on‑chain
-limit‑order DEX protocols (dYdX v4 & Serum). It then normalises price ticks,
-merges all ladders into one unified order‑book, and publishes both:
-
-1. A human‑readable top‑of‑book printout in the terminal every second.
-2. A JSON payload to Redis (pub/sub) so you can plug a dashboard later.
-
-No external services are required other than the exchanges themselves and a
-local Redis server (optional).  The whole file is ~250 lines including docs
-and can run on a basic VPS.
-
-Usage
------
-```bash
-python -m venv venv && source venv/bin/activate
-pip install -U ccxtpro websockets redis ujson asyncio aiohttp
-python aggregator.py
-```
-
-Configuration lives at the top of the file—just change the `SYMBOL` list or
-add more exchanges / DEX connectors.
+Cross-Venue Crypto Order-Book Aggregator
+（文档段落略，保持原样）
 """
 from __future__ import annotations
-import asyncio, json, math, time, logging, os, signal
-from typing import Dict, List, Tuple
+import asyncio, json, logging, os, signal, aiohttp
+from typing import Dict, List
 
-# ------------- USER CONFIG -------------------------------------------------- #
-# Spot / perp symbols in ccxt notation
+# -------------------- USER CONFIG -------------------- #
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
-# CEX id list — any exchange supported by ccxt.pro with WS order‑book
-CEXES = ["binance", "kraken", "coinbase"]
-# Depth levels to keep per book (None = full exchange limit)
+CEXES   = ["binance", "kraken", "coinbase"]
 DEPTH_LIMIT = 100
-# Redis output (set to None to disable)
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-# ---------------------------------------------------------------------------- #
+REDIS_URL   = os.environ.get("REDIS_URL")      # None → 禁用 Redis
+# ----------------------------------------------------- #
 
 import ccxt.pro as ccxtpro
 try:
-    import redis.asyncio as aioredis  # redis>=4.3 provides asyncio API
+    import redis.asyncio as aioredis
 except ImportError:
-    aioredis = None  # Redis is optional
+    aioredis = None
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("aggregator")
 
-# ----------------------- DATA STRUCTURES ------------------------------------ #
-# Ladder map: { price: {"bid": qty, "ask": qty } }
-Ladder = Dict[float, Dict[str, float]]
+Ladder = Dict[float, Dict[str, float]]          # {price:{bid,ask}}
 
+# -------------------- CEX 适配器 --------------------- #
 class ExchangeAdapter:
-    """Adapter that streams L2 order‑book for one CEX via ccxt.pro."""
     def __init__(self, exchange_id: str, symbols: List[str]):
         self.id = exchange_id
         self.symbols = symbols
         self.exchange = getattr(ccxtpro, exchange_id)({"enableRateLimit": True})
         self.books: Dict[str, Ladder] = {}
 
-    async def stream_symbol(self, symbol: str, tick_norm: float):
+    async def stream_symbol(self, symbol: str, tick: float):
         while True:
             try:
                 ob = await self.exchange.watch_order_book(symbol, limit=DEPTH_LIMIT)
-                self.books[symbol] = self._to_ladder(ob, tick_norm)
+                self.books[symbol] = self._to_ladder(ob, tick)
             except Exception as e:
-                log.warning(f"{self.id}:{symbol} stream error: {e}")
+                log.warning("%s:%s %s", self.id, symbol, e)
                 await asyncio.sleep(5)
 
     @staticmethod
-    def _to_ladder(ob, tick_norm: float) -> Ladder:
-        ladder: Ladder = {}
+    def _to_ladder(ob, tick: float) -> Ladder:
+        lad: Ladder = {}
         for side, key in [(ob["bids"], "bid"), (ob["asks"], "ask")]:
             for price, qty in side:
-                p = round(price / tick_norm) * tick_norm
-                ladder.setdefault(p, {"bid": 0.0, "ask": 0.0})
-                ladder[p][key] += qty
-        return ladder
+                p = round(price / tick) * tick
+                lad.setdefault(p, {"bid": 0.0, "ask": 0.0})[key] += qty
+        return lad
 
-    async def close(self):
-        await self.exchange.close()
-
-# ----------------------- DEX CONNECTORS ------------------------------------- #
+# -------------------- dYdX & Serum ------------------- #
 class DyDxAdapter:
-    """Minimal dYdX v4 Indexer WebSocket order‑book adapter."""
     URL = "wss://indexer.dydx.trade/v4/ws"
-
-    def __init__(self, market: str, tick_norm: float):
-        self.market = market
-        self.tick = tick_norm
-        self.ladder: Ladder = {}
+    def __init__(self, market: str, tick: float):
+        self.market, self.tick, self.ladder = market, tick, {}
 
     async def run(self):
         import websockets, ujson
         async for ws in websockets.connect(self.URL, ping_interval=None):
             try:
-                await ws.send(ujson.dumps({"type": "subscribe", "channel": "orderbook", "id": self.market}))
+                await ws.send(ujson.dumps({"type":"subscribe","channel":"orderbook","id":self.market}))
                 async for msg in ws:
-                    data = ujson.loads(msg)
-                    if data.get("type") == "subscribed":
-                        continue
-                    if data.get("type") == "snapshot":
-                        self.ladder = self._parse_rows(data["data"], full=True)
-                    elif data.get("type") == "delta":
-                        delta = self._parse_rows(data["data"], full=False)
-                        for p, d in delta.items():
-                            row = self.ladder.setdefault(p, {"bid": 0.0, "ask": 0.0})
-                            row["bid"] += d["bid"]
-                            row["ask"] += d["ask"]
+                    d = ujson.loads(msg)
+                    if d.get("type") == "snapshot":
+                        self.ladder = self._parse(d["data"], True)
+                    elif d.get("type") == "delta":
+                        delta = self._parse(d["data"], False)
+                        for p,row in delta.items():
+                            base = self.ladder.setdefault(p, {"bid":0.0,"ask":0.0})
+                            base["bid"] += row["bid"]; base["ask"] += row["ask"]
             except Exception as e:
-                log.warning("dYdX stream error %s", e)
+                log.warning("dYdX WS %s", e)
                 await asyncio.sleep(5)
 
-    def _parse_rows(self, rows, full: bool) -> Ladder:
-        ld: Ladder = {}
-        for side in ("bids", "asks") if full else ("bidsDelta", "asksDelta"):
+    def _parse(self, rows, full) -> Ladder:
+        out: Ladder = {}
+        for side in ("bids","asks") if full else ("bidsDelta","asksDelta"):
             key = "bid" if "bid" in side else "ask"
             for price, qty in rows.get(side, []):
-                p = round(float(price) / self.tick) * self.tick
-                ld.setdefault(p, {"bid": 0.0, "ask": 0.0})
-                ld[p][key] += float(qty)
-        return ld
+                p = round(float(price)/self.tick)*self.tick
+                out.setdefault(p, {"bid":0.0,"ask":0.0})[key] += float(qty)
+        return out
 
 class SerumAdapter:
-    """Fetches order‑book from Serum every N seconds (simplified)."""
     RPC = "https://api.mainnet-beta.solana.com"
-
-    def __init__(self, market_address: str, tick_norm: float):
-        self.market_addr = market_address
-        self.tick = tick_norm
-        self.ladder: Ladder = {}
+    def __init__(self, market_addr: str, tick: float):
+        self.addr, self.tick, self.ladder = market_addr, tick, {}
 
     async def run(self):
-        import aiohttp
         while True:
             try:
-                async with aiohttp.ClientSession() as sess:
-                    payload = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "getOrderbook",
-                        "params": [self.market_addr, {"limit": DEPTH_LIMIT}]
-                    }
-                    async with sess.post(self.RPC, json=payload, timeout=10) as r:
-                        data = await r.json()
-                        self.ladder = self._parse(data["result"])
+                payload = {"jsonrpc":"2.0","id":1,"method":"getOrderbook",
+                           "params":[self.addr,{"limit":DEPTH_LIMIT}]}
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(self.RPC, json=payload, timeout=10) as r:
+                        d = await r.json()
+                        self.ladder = self._parse(d["result"])
             except Exception as e:
-                log.warning("Serum RPC error %s", e)
+                log.warning("Serum RPC %s", e)
             await asyncio.sleep(1)
 
-    def _parse(self, result) -> Ladder:
-        ladder: Ladder = {}
-        for side_name, key in [("bids", "bid"), ("asks", "ask")]:
-            for row in result.get(side_name, [])[:DEPTH_LIMIT]:
-                price, qty, *_ = row
-                p = round(float(price) / self.tick) * self.tick
-                ladder.setdefault(p, {"bid": 0.0, "ask": 0.0})
-                ladder[p][key] += float(qty)
-        return ladder
+    def _parse(self, res) -> Ladder:
+        lad: Ladder = {}
+        for side,key in [("bids","bid"),("asks","ask")]:
+            for price, qty, *_ in res.get(side, [])[:DEPTH_LIMIT]:
+                p = round(float(price)/self.tick)*self.tick
+                lad.setdefault(p, {"bid":0.0,"ask":0.0})[key] += float(qty)
+        return lad
 
-# ------------------------ AGGREGATOR CORE ----------------------------------- #
+# ---------------------- 聚合核心 --------------------- #
 class Aggregator:
     def __init__(self, tick: float = 0.01, redis_url: str | None = None):
         self.tick = tick
         self.redis_url = redis_url
-        self.cache: dict[str, dict] = {}   # 供 start_tasks 写入
-        self.redis = None                  # 如果后面需要 Redis
-        # 其它原有的初始化内容保持不变
+        self.cache: dict[str, Ladder] = {}
+        self.redis = None
 
     async def init_redis(self):
         if self.redis_url and aioredis:
             self.redis = aioredis.from_url(self.redis_url, decode_responses=True)
 
     def merge(self, books: List[Ladder]) -> Ladder:
-        ladder: Ladder = {}
+        out: Ladder = {}
         for book in books:
-            for price, row in book.items():
-                p = round(price / self.tick) * self.tick
-                ladder.setdefault(p, {"bid": 0.0, "ask": 0.0})
-                ladder[p]["bid"] += row.get("bid", 0)
-                ladder[p]["ask"] += row.get("ask", 0)
-        return ladder
+            for p,r in book.items():
+                out.setdefault(p, {"bid":0.0,"ask":0.0})
+                out[p]["bid"] += r.get("bid",0); out[p]["ask"] += r.get("ask",0)
+        return out
 
-    async def publish(self, symbol: str, ladder: Ladder):
-        if not ladder:
-            return
-        bid = max((p for p, r in ladder.items() if r["bid"] > 0), default=None)
-        ask = min((p for p, r in ladder.items() if r["ask"] > 0), default=None)
-        print(f"{symbol} | top‑bid {bid:.2f} | top‑ask {ask:.2f} | spread {ask-bid:.2f}")
+    async def publish(self, sym:str, lad:Ladder):
+        if not lad: return
+        bid = max((p for p,r in lad.items() if r["bid"]>0), default=0)
+        ask = min((p for p,r in lad.items() if r["ask"]>0), default=0)
+        print(f"{sym} | top-bid {bid:.2f} | top-ask {ask:.2f} | spread {ask-bid:.2f}")
         if self.redis:
-            await self.redis.publish(symbol, json.dumps(ladder))
+            await self.redis.publish(sym, json.dumps(lad))
 
-# ---------------------------- MAIN ----------------------------------------- #
+# ---------------- FAST RUN ENTRY (optional CLI) ---------------- #
 async def main():
-    tick_norm = 0.01  # hard‑code for USDT pairs; adjust if needed
-    # --- start CEX streams
-    cex_adapters = [ExchangeAdapter(e, SYMBOLS) for e in CEXES]
-    cex_tasks = [a.stream_symbol(sym, tick_norm) for a in cex_adapters for sym in SYMBOLS]
+    tick = 0.01
+    cexs = [ExchangeAdapter(e, SYMBOLS) for e in CEXES]
+    dydx  = DyDxAdapter("BTC-USD", tick)
+    serum = SerumAdapter("9wFFo5AFZj7EBzLwGxFh8uRjwYwRApZW2Z7hJNPmT97z", tick)
 
-    # --- start DEX streams (example markets)
-    dydx = DyDxAdapter("BTC-USD", tick_norm)
-    serum = SerumAdapter("9wFFo5AFZj7EBzLwGxFh8uRjwYwRApZW2Z7hJNPmT97z", tick_norm)  # BTC/USDC market address
-    dex_tasks = [dydx.run(), serum.run()]
+    agg = Aggregator(tick, REDIS_URL); await agg.init_redis()
 
-    agg = Aggregator(tick_norm, REDIS_URL)
-    await agg.init_redis()
+    tasks = [c.stream_symbol(sym, tick) for c in cexs for sym in SYMBOLS] + \
+            [dydx.run(), serum.run()]
 
     async def loop():
         while True:
             for sym in SYMBOLS:
-                books = [a.books.get(sym, {}) for a in cex_adapters]
+                books = [c.books.get(sym,{}) for c in cexs]
                 if sym.startswith("BTC"):
-                    books.append(dydx.ladder)
-                    books.append(serum.ladder)
-                ladder = agg.merge(books)
-                await agg.publish(sym, ladder)
+                    books += [dydx.ladder, serum.ladder]
+                agg_lad = agg.merge(books)
+                await agg.publish(sym, agg_lad)
             await asyncio.sleep(1)
 
-    tasks = [*cex_tasks, *dex_tasks, loop()]
+    tasks.append(loop())
 
-    # Graceful shutdown
-    for s in (signal.SIGINT, signal.SIGTERM):
-        asyncio.get_running_loop().add_signal_handler(s, lambda: asyncio.create_task(shutdown(tasks)))
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_running_loop().add_signal_handler(
+            sig, lambda : [t.cancel() for t in tasks])
 
-    await asyncio.gather(*tasks)
-
-async def shutdown(tasks):
-    for t in tasks:
-        t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    asyncio.get_event_loop().stop()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-# ------------------ 供 backend 调用的统一启动入口 ------------------
-import asyncio
 
+# ----------------- 后端调用的启动入口 ---------------- #
 async def start_tasks(agg: "Aggregator"):
-    """
-    backend.py 调用这个协程后，会：
-    1. 启动所有 CEX / DEX WebSocket 订阅；
-    2. 每秒把合并后的 order-book 写进 agg.cache 供 WebSocket 读取。
-    """
-    tick = 0.01                              # 与全局配置保持一致
-
-    # 1) CEX streams
-    cexs = [ExchangeAdapter(e) for e in CEXES]
+    tick = agg.tick
+    cexs = [ExchangeAdapter(e, SYMBOLS) for e in CEXES]
     for c in cexs:
         for sym in SYMBOLS:
-            asyncio.create_task(c.stream(sym, tick))
+            asyncio.create_task(c.stream_symbol(sym, tick))
 
-    # 2) DEX streams（以 BTC 为例）
     dydx  = DyDxAdapter("BTC-USD", tick)
     serum = SerumAdapter("9wFFo5AFZj7EBzLwGxFh8uRjwYwRApZW2Z7hJNPmT97z", tick)
     asyncio.create_task(dydx.run())
     asyncio.create_task(serum.run())
 
-    # 3) 聚合循环
     async def loop():
         while True:
             for sym in SYMBOLS:
-                books = [c.books.get(sym, {}) for c in cexs]
+                books = [c.books.get(sym,{}) for c in cexs]
                 if sym.startswith("BTC"):
                     books += [dydx.ladder, serum.ladder]
                 agg.cache[sym] = agg.merge(books)
             await asyncio.sleep(1)
-
     asyncio.create_task(loop())
