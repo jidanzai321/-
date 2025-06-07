@@ -164,10 +164,12 @@ class SerumAdapter:
 
 # ------------------------ AGGREGATOR CORE ----------------------------------- #
 class Aggregator:
-    def __init__(self, tick_norm: float, redis_url: str | None = None):
-        self.tick = tick_norm
+    def __init__(self, tick: float = 0.01, redis_url: str | None = None):
+        self.tick = tick
         self.redis_url = redis_url
-        self.redis = None
+        self.cache: dict[str, dict] = {}   # 供 start_tasks 写入
+        self.redis = None                  # 如果后面需要 Redis
+        # 其它原有的初始化内容保持不变
 
     async def init_redis(self):
         if self.redis_url and aioredis:
