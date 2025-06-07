@@ -237,3 +237,37 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+# ------------------ 供 backend 调用的统一启动入口 ------------------
+import asyncio
+
+async def start_tasks(agg: "Aggregator"):
+    """
+    backend.py 调用这个协程后，会：
+    1. 启动所有 CEX / DEX WebSocket 订阅；
+    2. 每秒把合并后的 order-book 写进 agg.cache 供 WebSocket 读取。
+    """
+    tick = 0.01                              # 与全局配置保持一致
+
+    # 1) CEX streams
+    cexs = [ExchangeAdapter(e) for e in CEXES]
+    for c in cexs:
+        for sym in SYMBOLS:
+            asyncio.create_task(c.stream(sym, tick))
+
+    # 2) DEX streams（以 BTC 为例）
+    dydx  = DyDxAdapter("BTC-USD", tick)
+    serum = SerumAdapter("9wFFo5AFZj7EBzLwGxFh8uRjwYwRApZW2Z7hJNPmT97z", tick)
+    asyncio.create_task(dydx.run())
+    asyncio.create_task(serum.run())
+
+    # 3) 聚合循环
+    async def loop():
+        while True:
+            for sym in SYMBOLS:
+                books = [c.books.get(sym, {}) for c in cexs]
+                if sym.startswith("BTC"):
+                    books += [dydx.ladder, serum.ladder]
+                agg.cache[sym] = agg.merge(books)
+            await asyncio.sleep(1)
+
+    asyncio.create_task(loop())
